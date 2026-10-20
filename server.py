@@ -387,7 +387,7 @@ def lan_ips():
     """返回 [(ip, 网卡名)]。优先 iproute2 枚举全局地址（不被代理 TUN 默认路由误导），
     过滤 fake-ip 网段与常见虚拟网卡（docker/veth/网桥/TUN），保留物理/无线/Tailscale。"""
     fake = ipaddress.ip_network("198.18.0.0/15")  # RFC 2544, 常被代理 TUN(fake-ip)占用
-    skip_ifaces = ("docker", "veth", "br-", "virbr", "tun", "utun", "zt")
+    skip_ifaces = ("docker", "veth", "br-", "virbr", "lxc", "tun", "utun", "zt")
     result = {}
     try:
         out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
