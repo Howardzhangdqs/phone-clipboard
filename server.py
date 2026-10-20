@@ -384,25 +384,42 @@ class QuietServer(ThreadingHTTPServer):
 
 
 def lan_ips():
-    # RFC 2544 基准网段(198.18.0.0/15)常被代理 TUN(fake-ip)占用，不是真实局域网地址
-    fake = ipaddress.ip_network("198.18.0.0/15")
-    ips = set()
-    try:  # 不实际发包，仅让内核选路由拿本机出口 IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("223.5.5.5", 80))
-        ips.add(s.getsockname()[0])
-        s.close()
-    except OSError:
-        pass
+    """返回 [(ip, 网卡名)]。优先 iproute2 枚举全局地址（不被代理 TUN 默认路由误导），
+    过滤 fake-ip 网段与常见虚拟网卡（docker/veth/网桥/TUN），保留物理/无线/Tailscale。"""
+    fake = ipaddress.ip_network("198.18.0.0/15")  # RFC 2544, 常被代理 TUN(fake-ip)占用
+    skip_ifaces = ("docker", "veth", "br-", "virbr", "tun", "utun", "zt")
+    result = {}
     try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if not ip.startswith(("127.", "169.254.")):
-                ips.add(ip)
-    except OSError:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, timeout=3).stdout.decode()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and not parts[1].startswith(skip_ifaces):
+                ip = parts[3].split("/")[0]
+                if ipaddress.ip_address(ip) not in fake:
+                    result[ip] = parts[1]
+    except Exception:
         pass
-    return sorted(ip for ip in ips
-                  if ipaddress.ip_address(ip) not in fake)
+    if not result:  # 回退: UDP connect 探测出口 IP（无 iproute2 时）
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("223.5.5.5", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ipaddress.ip_address(ip) not in fake:
+                result[ip] = ""
+        except OSError:
+            pass
+    if not result:  # 回退: 主机名解析
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if not ip.startswith(("127.", "169.254.")) and \
+                        ipaddress.ip_address(ip) not in fake:
+                    result.setdefault(ip, "")
+        except OSError:
+            pass
+    return sorted(result.items())
 
 
 def main():
@@ -429,9 +446,9 @@ def main():
     print(f"  会话类型: {session}")
     print(f"  剪贴板后端链: {backend_chain()}")
     print("  手机连同一 Wi-Fi，用手机浏览器打开:")
-    for ip in ips:
+    for ip, iface in ips:
         url = f"http://{ip}:{args.port}"
-        print(f"    {url}")
+        print(f"    {url}" + (f"  ({iface})" if iface else ""))
         try:  # 装了 qrcode 库就在终端直接显示二维码（可选）
             import qrcode
             qr = qrcode.QRCode(border=1)
