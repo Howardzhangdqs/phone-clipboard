@@ -81,8 +81,8 @@ options:
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/` | 网页界面 |
-| `GET` | `/api/ping` | 健康检查，返回 `{"ok": true, "tool": "<后端名>"}` |
-| `POST` | `/api/copy` | 请求体 `{"text": "..."}`，写入剪贴板，返回 `{"ok": bool, "tool": str, "error": str}` |
+| `GET` | `/api/ping` | 健康检查，返回 `{"ok": true, "chain": "gtk+免历史 → xclip → ..."}` |
+| `POST` | `/api/copy` | 请求体 `{"text": "..."}`，写入剪贴板，返回 `{"ok": bool, "tool": str, "error": str}`；失败时 `error` 含逐后端失败原因 |
 
 限制：请求体上限 10 MiB（超出返回 `413`）；`text` 必须为字符串，空字符串不修改剪贴板。
 
@@ -95,11 +95,16 @@ options:
                         │    写入时同时提供 text/* 与 x-kde-passwordManagerHint，
                         │    剪贴板历史工具 (Copyous/Klipper) 依提示不记录
                         │
-                        ├─ 回退: wl-copy → xclip → xsel → pbcopy (子进程)
+                        ├─ 按会话类型回退: Wayland 会话 → wl-copy
+                        │                X11 会话   → xclip → xsel
+                        │                macOS      → pbcopy
                         └─ 最终回退: pyperclip (如已安装)
 ```
 
-- `_clip_writer.py` 以独立进程运行：成功则持有剪贴板所有权常驻（他人覆写或 1 小时后退出，不堆积进程）；GTK4/显示不可用时以退出码 `3` 立即失败，`server.py` 自动改用下一级后端
+- **后端按会话类型选择，而非按安装与否**：X11 会话里跳过 wl-copy（装了也连不上 Wayland），Wayland 会话优先 wl-copy——避免"装了但不可用"的后端被误选中
+- **每次写入都校验**：检查子进程返回码 + 读回剪贴板比对，失败自动切换下一后端，全部失败才报错并在响应/日志中给出逐后端原因
+- `_clip_writer.py` 以独立进程运行：成功则持有剪贴板所有权常驻（他人覆写或 1 小时后退出，不堆积进程）；GTK4/显示不可用时快速失败（≤1.5 秒），`server.py` 自动改用下一级后端
+- 启动横幅显示会话类型与完整后端链；`/api/ping` 同样返回链描述
 - 服务端主动关闭空闲 30 秒的 keep-alive 连接，并对手机锁屏产生的 `ConnectionReset` 静默处理，避免日志噪音
 
 ## 安全模型
@@ -136,10 +141,13 @@ systemctl --user enable --now phone-clipboard.service
 | 现象 | 处理 |
 |---|---|
 | 手机打不开页面 | 确认同一 Wi-Fi；检查电脑防火墙（`sudo ufw status`）；换端口重试 |
+| 启动横幅打印 198.18.x.x 地址 | 代理 TUN (fake-ip) 网段已被自动过滤；若仍异常，用 `ip addr` 查真实局域网 IP |
 | 页面显示"未连接" | 服务是否仍在运行；端口是否被占用（`ss -tlnp | grep 8686`） |
-| 复制失败：未找到剪贴板后端 | 安装 `xclip` / `wl-clipboard` 之一，或 `pip install pyperclip` |
+| 复制失败：所有剪贴板后端均失败 | 响应/日志里有逐后端原因。X11 会话需 `xclip` 或 `xsel`，Wayland 会话需 `wl-clipboard`，或 `pip install pyperclip` |
+| X11 桌面但日志出现 wl-copy(rc=1) | 0.2.0 起按会话选择后端，不应再出现；若出现说明服务启动时无 `DISPLAY`/`WAYLAND_DISPLAY`，请在桌面终端启动 |
 | Wayland 下 GTK4 写入失败 | 已知限制：无头 Wayland 的 `set_selection` 会被 mutter 拒绝，程序会自动回退 |
 | 内容进入剪贴板历史 | GTK4 写入器未生效（无图形环境/GTK4），此时走 wl-copy/xclip，属正常行为 |
+| SSH 里启动后复制全部失败 | SSH 会话没有 `DISPLAY`/`WAYLAND_DISPLAY`，后端链为空；在桌面终端启动，或 `export DISPLAY=:0`（X11）后再启动 |
 
 ## 路线图
 

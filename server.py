@@ -9,12 +9,16 @@
 手机和电脑连同一 Wi-Fi，用手机浏览器打开启动时打印的局域网地址即可。
 页面包含: 输入框 / 连接状态按钮 / 清空按钮；输入停顿 1 秒后自动推送到电脑剪贴板。
 
-电脑端剪贴板通道（自动探测）:
+电脑端剪贴板通道（按会话环境自动排序，写入后读回校验，逐个回退）:
   首选 _clip_writer.py (GTK4): 附带 x-kde-passwordManagerHint 提示，
       Copyous / Klipper 等剪贴板历史工具不记录这些写入（粘贴不受影响）；
-  回退: wl-copy(Wayland) / xclip / xsel(X11) / pbcopy(macOS) / pyperclip。
+  随后按会话类型选择: Wayland 会话用 wl-copy，X11 会话用 xclip / xsel，
+      macOS 用 pbcopy，最终回退 pyperclip。
+  每次写入都会读回校验，失败自动切换下一后端并在日志中说明原因，
+  不再出现"装了 wl-copy 但处于 X11 会话 → 静默失败却报成功"的情况。
 """
 import argparse
+import ipaddress
 import json
 import os
 import shutil
@@ -165,13 +169,30 @@ HTML = r"""<!doctype html>
 </html>
 """
 
-CLIP_CMDS = [
-    ["wl-copy"],                           # Wayland
-    ["xclip", "-selection", "clipboard"],  # X11
-    ["xsel", "--clipboard", "--input"],    # X11
-    ["pbcopy"],                            # macOS
-]
-TOOL = next((c for c in CLIP_CMDS if shutil.which(c[0])), None)
+# ── 剪贴板后端链 ──────────────────────────────────────────────────────
+# 按"当前会话类型"而非"装没装"挑选候选: 在 X11 会话里 wl-copy 形同虚设，
+# 在 Wayland 会话里 xclip 依赖 XWayland——只有匹配会话的后端才进链。
+WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
+X11 = bool(os.environ.get("DISPLAY"))
+
+CLIP_CMDS = []
+if WAYLAND and shutil.which("wl-copy"):
+    CLIP_CMDS.append(["wl-copy"])                           # Wayland 原生
+if X11:
+    if shutil.which("xclip"):
+        CLIP_CMDS.append(["xclip", "-selection", "clipboard"])  # X11
+    if shutil.which("xsel"):
+        CLIP_CMDS.append(["xsel", "--clipboard", "--input"])    # X11
+if sys.platform == "darwin" and shutil.which("pbcopy"):
+    CLIP_CMDS.append(["pbcopy"])                             # macOS
+
+# 各写入后端对应的读回命令（用于写入校验；读取器缺失时跳过校验）
+READ_CMDS = {
+    "wl-copy": ["wl-paste", "--no-newline"],
+    "xclip":   ["xclip", "-selection", "clipboard", "-o"],
+    "xsel":    ["xsel", "--clipboard", "--output"],
+    "pbcopy":  ["pbpaste"],
+}
 
 WRITER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_clip_writer.py")
 
@@ -193,45 +214,106 @@ def writer_available():
 WRITER_OK = writer_available()
 
 
+def read_clipboard():
+    """读回剪贴板文本（写入校验用）。无匹配会话的读取器时返回 None（跳过校验）。"""
+    for name, cmd in READ_CMDS.items():
+        if not shutil.which(cmd[0]):
+            continue
+        if name == "wl-copy" and not WAYLAND:
+            continue
+        if name in ("xclip", "xsel") and not X11 and sys.platform != "darwin":
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", "replace")
+        except Exception:
+            pass
+    return None
+
+
 def set_clipboard_gtk(text):
-    """优先通道: 经 _clip_writer.py 写入，剪贴板历史工具不记录。"""
+    """优先通道: 经 _clip_writer.py 写入，剪贴板历史工具不记录。
+    子进程存活且读回一致才算成功；1.5 秒内退出非零码则失败进下一后端。"""
     try:
         p = subprocess.Popen([sys.executable, WRITER], stdin=subprocess.PIPE,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         p.stdin.write(text.encode("utf-8"))
         p.stdin.close()
-        time.sleep(0.35)  # 成功则常驻持有所有权不退出；失败会立刻退出
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            rc = p.poll()
+            if rc not in (None, 0):          # 快速失败（GTK4/显示缺失等）
+                return False, "gtk", f"writer rc={rc}"
+            if rc is None:
+                got = read_clipboard()
+                if got == text:              # 已持有所有权且内容一致
+                    return True, "gtk+免历史", ""
+                if got is not None and got != text and time.monotonic() > deadline - 1.2:
+                    pass  # 前期初始化中，继续等
+            time.sleep(0.15)
         rc = p.poll()
-        if rc is None or rc == 0:
+        if rc is None or rc == 0:            # 超时仍在运行: 校验一次，读不出则信任存活状态
+            got = read_clipboard()
+            if got is not None and got != text:
+                return False, "gtk", "写入后读回不一致"
             return True, "gtk+免历史", ""
         return False, "gtk", f"writer rc={rc}"
     except Exception as e:
         return False, "gtk", str(e)
 
 
+def set_clipboard_cli(cmd, text):
+    """CLI 后端写入 + 返回码校验 + 读回校验。"""
+    try:
+        p = subprocess.run(cmd, input=text.encode("utf-8"),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=5)
+        if p.returncode != 0:
+            return False, cmd[0], f"rc={p.returncode}"
+        time.sleep(0.15)                     # 等后端接管剪贴板
+        got = read_clipboard()
+        if got is not None and got != text:
+            return False, cmd[0], "写入后读回不一致"
+        return True, cmd[0], ""
+    except subprocess.TimeoutExpired:
+        return False, cmd[0], "写入超时"
+    except Exception as e:
+        return False, cmd[0], str(e)
+
+
 def set_clipboard(text: str):
-    """把文本写入系统剪贴板，返回 (ok, tool, error)。"""
+    """沿后端链逐个尝试（每次写入均校验），返回首个通过的 (ok, tool, error)。"""
+    failed = []
     if WRITER_OK:
         ok, tool, err = set_clipboard_gtk(text)
         if ok:
             return ok, tool, err
-    if TOOL:
-        try:
-            p = subprocess.Popen(TOOL, stdin=subprocess.PIPE,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            p.communicate(text.encode("utf-8"), timeout=5)
-            return True, TOOL[0], ""
-        except subprocess.TimeoutExpired:
-            p.kill()
-            return True, TOOL[0], "(写入超时，内容通常已生效)"
-        except Exception as e:
-            return False, TOOL[0], str(e)
-    try:  # 回退: pyperclip
+        failed.append(f"{tool}({err})")
+    for cmd in CLIP_CMDS:
+        ok, tool, err = set_clipboard_cli(cmd, text)
+        if ok:
+            return ok, tool, err
+        failed.append(f"{tool}({err})")
+    try:  # 最终回退: pyperclip
         import pyperclip
         pyperclip.copy(text)
         return True, "pyperclip", ""
     except Exception:
-        return False, "", "未找到剪贴板后端，请安装 xclip / wl-clipboard / pyperclip 之一"
+        pass
+    detail = "; ".join(failed) if failed else "未找到匹配当前会话的剪贴板后端"
+    return False, "", f"所有剪贴板后端均失败: {detail}"
+
+
+def backend_chain():
+    """人类可读的后端链描述（启动横幅 / ping 用）。"""
+    names = (["gtk+免历史"] if WRITER_OK else []) + [c[0] for c in CLIP_CMDS]
+    try:
+        import pyperclip  # noqa: F401
+        names.append("pyperclip")
+    except Exception:
+        pass
+    return " → ".join(names) if names else "无(复制将失败)"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -251,7 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, HTML, "text/html; charset=utf-8")
         elif self.path == "/api/ping":
             self._send(200, json.dumps(
-                {"ok": True, "tool": (TOOL[0] if TOOL else "pyperclip?")}, ensure_ascii=False))
+                {"ok": True, "chain": backend_chain()}, ensure_ascii=False))
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}, ensure_ascii=False))
 
@@ -272,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, json.dumps(
                 {"ok": False, "error": f"bad request: {e}"}, ensure_ascii=False))
         if text == "":  # 空内容: 不动剪贴板（前端已拦截，这里兜底）
-            ok, tool, err = True, (TOOL[0] if TOOL else "?"), "(空内容，跳过复制)"
+            ok, tool, err = True, "skip", "(空内容，跳过复制)"
         else:
             ok, tool, err = set_clipboard(text)
         self._send(200, json.dumps({"ok": ok, "tool": tool, "error": err}, ensure_ascii=False))
@@ -302,6 +384,8 @@ class QuietServer(ThreadingHTTPServer):
 
 
 def lan_ips():
+    # RFC 2544 基准网段(198.18.0.0/15)常被代理 TUN(fake-ip)占用，不是真实局域网地址
+    fake = ipaddress.ip_network("198.18.0.0/15")
     ips = set()
     try:  # 不实际发包，仅让内核选路由拿本机出口 IP
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -317,7 +401,8 @@ def lan_ips():
                 ips.add(ip)
     except OSError:
         pass
-    return sorted(ips)
+    return sorted(ip for ip in ips
+                  if ipaddress.ip_address(ip) not in fake)
 
 
 def main():
@@ -326,9 +411,11 @@ def main():
     ap.add_argument("-b", "--bind", default="0.0.0.0")
     args = ap.parse_args()
 
-    if TOOL is None and not WRITER_OK:
-        print("⚠ 未检测到 wl-copy / xclip / xsel / pbcopy / GTK4，复制可能失败；"
+    if not CLIP_CMDS and not WRITER_OK:
+        print("⚠ 未检测到匹配当前会话的剪贴板后端（wl-copy / xclip / xsel / GTK4），复制可能失败；"
               "安装任一即可: sudo apt install xclip 或 wl-clipboard")
+    elif not WRITER_OK and os.environ.get("DISPLAY") is None:
+        print("⚠ 无图形环境(DISPLAY 未设置)，GTK4 免历史通道未启用，建议在桌面终端启动")
 
     try:
         srv = QuietServer((args.bind, args.port), Handler)
@@ -338,9 +425,9 @@ def main():
     ips = lan_ips()
     print("═" * 46)
     print("  手机 → 电脑剪贴板  已启动")
-    backend = "gtk4+免历史提示" if WRITER_OK else (TOOL[0] if TOOL else "pyperclip(未确认)")
-    print(f"  剪贴板后端: {backend}"
-          + ("" if WRITER_OK else "  (会进入剪贴板历史)"))
+    session = "Wayland" if WAYLAND else ("X11" if X11 else "无图形")
+    print(f"  会话类型: {session}")
+    print(f"  剪贴板后端链: {backend_chain()}")
     print("  手机连同一 Wi-Fi，用手机浏览器打开:")
     for ip in ips:
         url = f"http://{ip}:{args.port}"
